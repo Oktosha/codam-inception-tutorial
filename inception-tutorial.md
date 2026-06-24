@@ -645,6 +645,12 @@ RUN apk add --no-cache mariadb mariadb-client \
     && chown -R mysql:mysql /var/lib/mysql /run/mysqld
 
 COPY conf/my.cnf /etc/my.cnf.d/inception.cnf
+# Alpine's mariadb package ships /etc/my.cnf.d/mariadb-server.cnf with
+# `skip-networking` enabled (no TCP listener). Files in /etc/my.cnf.d/ are read
+# in alphabetical order, so mariadb-server.cnf loads AFTER inception.cnf and its
+# skip-networking wins — leaving the DB reachable only over its unix socket.
+# Neutralize it at the source so the wordpress container can connect over TCP.
+RUN sed -i 's/^skip-networking/#skip-networking/' /etc/my.cnf.d/mariadb-server.cnf
 COPY tools/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -652,9 +658,12 @@ EXPOSE 3306
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
+> ⚠️ **Why the `sed` line matters (a real gotcha).** Without it, MariaDB starts but reports `port: 0` / `skip_networking = ON`, and the only TCP listener in the container is Docker's internal DNS — so WordPress's `mariadb -hmariadb ...` connection silently fails forever in the wait‑loop. The Alpine default config simply overrides your `inception.cnf` because it loads later alphabetically. Setting `skip-networking=0` in your own `my.cnf` (below) makes the intent explicit, but the `sed` is what actually wins the ordering — keep both.
+
 **`srcs/requirements/mariadb/conf/my.cnf`:**
 ```ini
 [mysqld]
+skip-networking = 0          # make intent explicit: DO accept TCP connections
 skip-host-cache
 skip-name-resolve
 bind-address = 0.0.0.0        # accept connections from the wordpress container
@@ -771,12 +780,17 @@ RUN apk add --no-cache \
         curl bash mariadb-client \
     && ln -sf /usr/bin/php82 /usr/bin/php \
     && mkdir -p /var/www/html /run/php \
-    && adduser -D -H -u 82 -s /sbin/nologin www-data 2>/dev/null || true
+    && adduser -D -H -G www-data -u 82 -s /sbin/nologin www-data
 
 # Install WP-CLI (this is a TOOL, not a ready-made app image — allowed).
 RUN curl -o /usr/local/bin/wp \
         https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
     && chmod +x /usr/local/bin/wp
+
+# php-cli defaults to memory_limit=128M, which WP-CLI's tarball extraction
+# (`wp core download`) blows past with a fatal "Allowed memory size exhausted".
+# Raise it for the CLI (the scan dir is read by both php-cli and php-fpm).
+RUN echo "memory_limit = 512M" > /etc/php82/conf.d/99-memory.ini
 
 COPY conf/www.conf /etc/php82/php-fpm.d/www.conf
 COPY tools/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -788,6 +802,10 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
 > 📝 PHP package names depend on the Alpine version (`php82`, `php83`, …). On your chosen Alpine, run `apk search php8` to find the right ones, and **match the php‑fpm config path** (`/etc/phpXX/php-fpm.d/www.conf`).
+
+> ⚠️ **Two Alpine‑specific gotchas baked into the Dockerfile above — don't drop them:**
+> 1. **`www-data` user.** Alpine's `php82-fpm` package already creates the **group** `www-data` (GID 82) but **no user**. A naive `adduser -u 82 ... www-data` then fails because it tries to create a *new* group at GID 82 that already exists — and if you hide that with `2>/dev/null || true`, the failure passes silently and php‑fpm later dies with `cannot get uid for user 'www-data'` / `FPM initialization failed` (crash loop). The fix is `adduser ... -G www-data -u 82 ...` (reuse the existing group) **without** the `|| true`, so a real failure surfaces at build time.
+> 2. **php‑cli `memory_limit`.** The default 128M is too low for `wp core download` to unzip WordPress; it dies with `Allowed memory size of 134217728 bytes exhausted`. Note that `WP_CLI_PHP_ARGS` does **not** help here — that env var is read only by wp‑cli's bash *wrapper*, while you installed the raw `.phar` directly, so it runs under the default ini. Raising `memory_limit` via an ini in the scan dir (as above) is the reliable fix.
 
 **`srcs/requirements/wordpress/conf/www.conf`** — make php‑fpm listen on the network (so nginx can reach it on `wordpress:9000`):
 ```ini
