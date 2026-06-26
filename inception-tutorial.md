@@ -1072,10 +1072,13 @@ re: down up
 clean:
 	docker compose -f $(COMPOSE) down
 
-# Full wipe: containers, volumes, and host data. DESTRUCTIVE.
-fclean: down
+# Full wipe: containers, network, named volumes, images, build cache, host data. DESTRUCTIVE.
+# `down -v` removes the named volumes (srcs_db/srcs_wp); since they are bind-backed,
+# the host data underneath survives volume removal, so we also rm the data dir itself.
+fclean:
+	docker compose -f $(COMPOSE) down -v
 	docker system prune -af
-	@sudo rm -rf $(DATA)/db $(DATA)/wordpress
+	@sudo rm -rf $(DATA)
 
 .PHONY: all check-env up down stop start re clean fclean
 ```
