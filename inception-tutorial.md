@@ -29,6 +29,7 @@ Stages 2 and 3 are deliberately separate. Stage 2 is a *throwaway sandbox* to un
   - [3.7 Makefile](#stage-3-7)
 - [Stage 4 — Rules checklist, docs & defense prep](#stage-4)
 - [Bonus](#bonus)
+- [Defense — live demo cheat sheet](#defense)
 
 ---
 
@@ -160,6 +161,21 @@ Docker Desktop's hidden one.
    sudo usermod -aG docker $USER     # log out/in so docker works without sudo
    docker compose version            # confirm the compose plugin is present
    ```
+
+   > 🛠️ **Installing `make` inside the VM.** A fresh Ubuntu Server image often has **no `make`**,
+   > and the whole project is driven by it (`make`, `make re`, `make fclean` — see Stage 3.7). The
+   > `apt install` line above already pulls it in, but if you skipped that or hit `make: command not
+   > found` later, install it on its own:
+   > ```bash
+   > sudo apt update && sudo apt install -y make   # Debian/Ubuntu (apt)
+   > make --version                                # confirm it's on PATH (e.g. GNU Make 4.3)
+   > ```
+   > - Need a full C toolchain too (for some bonuses)? `sudo apt install -y build-essential` bundles
+   >   `make`, `gcc`, and friends.
+   > - On an **Alpine** VM instead of Ubuntu it's `sudo apk add make`; on **Fedora/RHEL**,
+   >   `sudo dnf install make`. The school's Ubuntu VM uses `apt`, same as above.
+   > - `make` only needs to exist on the **VM host** — it shells out to `docker compose`, which runs
+   >   your containers. You do **not** install `make` inside any of the three service images.
 4. Clone your repo *inside the VM*, develop and test exactly as the tutorial describes.
 5. `git push` from the VM → at school, `git pull` into the x86_64 VM and run `make`. It rebuilds for
    x86_64 with no edits.
@@ -1012,11 +1028,31 @@ The subject requires a Makefile at the repo root that builds everything via `doc
 NAME    = inception
 COMPOSE = srcs/docker-compose.yml
 DATA    = /home/dkolodze/data
+ENV     = srcs/.env
+SECRETS = secrets/db_root_password.txt secrets/db_password.txt \
+          secrets/wp_admin_password.txt secrets/wp_user_password.txt
 
 all: up
 
+# Fail fast (BEFORE the slow image build) if config/credentials are missing.
+# We do NOT auto-create them from the *.example templates on purpose: that would
+# boot the stack with placeholder passwords. Tell the user exactly what to do.
+check-env:
+	@missing=0; \
+	for f in $(ENV) $(SECRETS); do \
+		[ -f "$$f" ] || { echo "  missing: $$f"; missing=1; }; \
+	done; \
+	if [ "$$missing" -ne 0 ]; then \
+		echo "ERROR: required config/secret files are missing (see above)."; \
+		echo "Create them from the tracked templates, then fill in real values:"; \
+		echo '    cp srcs/.env.example srcs/.env'; \
+		echo '    for f in secrets/*.txt.example; do cp "$$f" "$${f%.example}"; done'; \
+		echo 'Details: DEV_DOC.md -> "Set up from scratch".'; \
+		exit 1; \
+	fi
+
 # Create host dirs that back the named volumes, then build + start.
-up:
+up: check-env
 	@mkdir -p $(DATA)/db $(DATA)/wordpress
 	docker compose -f $(COMPOSE) up -d --build
 
@@ -1041,9 +1077,25 @@ fclean: down
 	docker system prune -af
 	@sudo rm -rf $(DATA)/db $(DATA)/wordpress
 
-.PHONY: all up down stop start re clean fclean
+.PHONY: all check-env up down stop start re clean fclean
 ```
 > Adjust `clean`/`fclean` semantics to your taste, but keep `all`, `up`/`down`, `re`, `clean`, `fclean` — evaluators expect them.
+
+> 🛟 **Why the `check-env` pre-flight (a real UX gotcha).** On a fresh clone, `srcs/.env` and
+> the `secrets/*.txt` files don't exist yet (they're git-ignored — only the `*.example`
+> templates are committed). Without this guard, `make` behaves badly depending on *what's*
+> missing:
+> - **`.env` missing** → Compose stops immediately with `env file .../srcs/.env not found` (clear enough).
+> - **a secret file missing** → Compose **builds all three images first** (minutes wasted),
+>   *then* dies at container-create with an obscure
+>   `invalid mount config for type "bind": bind source path does not exist: .../secrets/db_root_password.txt`
+>   — which doesn't obviously mean "create your secret files."
+>
+> Making `up` depend on `check-env` validates every required file **before** the build and
+> prints an actionable message instead. Note the deliberate choice **not** to give make a rule
+> that copies the `*.example` files for you: that would "succeed" by booting WordPress with
+> `CHANGE_ME` placeholder passwords — a silent, worse failure than stopping. A validation
+> prerequisite is the right kind of "Makefile dependency" here; auto-generating secrets is not.
 
 ### 3.8 Bring it up & verify
 
@@ -1135,6 +1187,141 @@ Each bonus service = its own Dockerfile + container (+ volume if needed). Same r
 - A **service of your choice** you can justify at defense.
 
 > ⚠️ Bonus is graded **only if the mandatory part is perfect**. Don't start it until everything in the checklist passes.
+
+---
+
+<a name="defense"></a>
+## Defense — live demo cheat sheet
+
+Stage 4 lists the *conceptual* answers ("Defense questions you should be able to answer").
+This section is the **practical companion**: for each thing an evaluator typically asks, the
+exact command that **proves it on the running stack**. Every command below was run against this
+project and produces the evidence shown.
+
+> 🔧 **Setup.** Run these from the repo root (`~/codam-inception`) with the stack up (`make`).
+> The Docker resource names are prefixed with the Compose project name, which defaults to the
+> directory of the compose file — here **`srcs`** — so the network is `srcs_inception` and the
+> volumes are `srcs_db` / `srcs_wp`. A shortcut used throughout:
+> ```bash
+> C="docker compose -f srcs/docker-compose.yml"
+> ```
+
+### 0. Is everything running?
+```bash
+$C ps                                  # all three: mariadb, wordpress, nginx -> Up
+```
+
+### 1. NGINX is the only entrypoint, on port 443 only
+*"Show me nothing else is exposed to the host."*
+```bash
+$C ps                                  # only nginx shows a host mapping (...->443)
+docker container inspect nginx --format '{{json .NetworkSettings.Ports}}'
+#   -> {"443/tcp":[{"HostIp":"0.0.0.0","HostPort":"443"}, ...]}   (and nothing else)
+```
+mariadb (3306) and wordpress (9000) expose ports only **inside** the Docker network.
+
+### 2. TLS: only TLSv1.2 / TLSv1.3 are accepted  *(the headline question)*
+*"Prove the server refuses old protocols."* Test the **server** with `openssl s_client`, not a
+`curl --tlsvX` client flag (modern clients disable old TLS themselves, so a client-side failure
+proves nothing):
+```bash
+for v in tls1_2 tls1_3 tls1_1; do \
+  echo | openssl s_client -connect localhost:443 -$v >/dev/null 2>&1 \
+    && echo "$v: ACCEPTED" || echo "$v: refused"; done
+#   -> tls1_2: ACCEPTED   tls1_3: ACCEPTED   tls1_1: refused
+```
+> Use `-tls1_1` (your nginx genuinely refuses it). Don't rely on `-tls1`/`-ssl3` here: many
+> modern OpenSSL builds removed those client-side, so a "refused" would prove nothing about the
+> *server*. For the authoritative list of exactly which protocols the **server** accepts, use
+> nmap (install with `apk add nmap` / `sudo apt install -y nmap` if missing):
+> ```bash
+> nmap --script ssl-enum-ciphers -p 443 dkolodze.42.fr   # lists ONLY TLSv1.2 and TLSv1.3
+> ```
+Responsible code: `nginx/conf/nginx.conf` → `listen 443 ssl;` and `ssl_protocols TLSv1.2 TLSv1.3;`.
+
+### 3. Each service runs its real daemon as PID 1 (no keep-alive hacks)
+*"What's PID 1 — is it a `tail -f`/`sleep infinity` trick?"*
+```bash
+for s in mariadb wordpress nginx; do printf "%-10s " "$s"; \
+  $C exec -T $s ps -o pid,args | awk '$1==1{$1="";print}'; done
+#   mariadb    mariadbd --user=mysql
+#   wordpress  php-fpm: master process ...
+#   nginx      nginx: master process nginx -g daemon off;
+grep -rnE "tail -f|sleep infinity|while true" srcs/requirements/   # -> nothing (no hacks)
+```
+
+### 4. Images are built (not pulled), named == service, no `latest`, penultimate Alpine
+```bash
+grep -rn "^FROM" srcs/requirements/*/Dockerfile   # all FROM alpine:3.22 — pinned, no :latest
+grep -n "image:"  srcs/docker-compose.yml         # image names == service names
+$C exec -T nginx cat /etc/os-release | head -2    # confirm the Alpine version live
+```
+Be ready to justify **why 3.22 is penultimate** on submission day (newest stable was 3.2x; you
+picked the second-newest).
+
+### 5. A custom network is declared; no `host`, no `--link`/`links`
+```bash
+docker network inspect srcs_inception --format '{{.Name}} driver={{.Driver}} containers={{len .Containers}}'
+#   -> srcs_inception driver=bridge containers=3
+grep -nE "network_mode|links:|--link" srcs/docker-compose.yml   # -> nothing
+$C exec -T wordpress getent hosts mariadb   # service-name DNS works (resolves on the bridge)
+```
+
+### 6. Two named volumes, physically under `/home/dkolodze/data`, not service bind mounts
+```bash
+docker volume inspect srcs_db srcs_wp --format '{{.Name}} -> {{.Options.device}}'
+#   -> srcs_db -> /home/dkolodze/data/db     srcs_wp -> /home/dkolodze/data/wordpress
+ls /home/dkolodze/data/db /home/dkolodze/data/wordpress   # real data on the host path
+```
+Know the distinction (per 3.3): these are **named** volumes the services reference by name; the
+`local` driver merely stores their data at that host path. That is *not* a forbidden service-level
+bind mount (`- /host:/container`).
+
+### 7. No passwords in Dockerfiles; credentials come from secrets; secrets/.env not committed
+```bash
+grep -rin "password" srcs/requirements/*/Dockerfile   # -> nothing
+$C exec -T mariadb ls -1 /run/secrets/                # db_root_password, db_password (mounted ro)
+git ls-files | grep -E 'secret|\.env'                 # -> only *.example, never real creds
+git check-ignore srcs/.env secrets/db_password.txt    # -> both printed = both ignored
+```
+
+### 8. WordPress has exactly two users; the admin name is clean
+```bash
+$C exec -T wordpress wp user list --allow-root --fields=user_login,roles
+#   bossman  administrator     <- no "admin"/"administrator" in the name
+#   editor   author
+```
+
+### 9. The database works and WordPress is connected to it
+```bash
+$C exec -T mariadb mariadb -uroot -p"$(cat secrets/db_root_password.txt)" \
+  -e "SHOW DATABASES; SELECT user,host FROM mysql.user;"     # 'wordpress' DB + wp_user@'%'
+$C exec -T wordpress wp core is-installed --allow-root && echo "WP installed & DB-connected"
+curl -sk -H "Host: dkolodze.42.fr" https://localhost:443 -o /dev/null -w "site: HTTP %{http_code}\n"
+```
+
+### 10. Every service restarts on crash
+```bash
+docker container inspect mariadb wordpress nginx \
+  --format '{{.Name}}: restart={{.HostConfig.RestartPolicy.Name}}'   # -> always (x3)
+```
+> ⚠️ Use `docker container inspect` (not `docker inspect`): plain `docker inspect mariadb`
+> matches the **image** named `mariadb` first and returns the wrong object.
+
+### 11. Data persists across a full restart
+```bash
+$C exec -T wordpress wp user create demo demo@x.com --role=author --user_pass=x --allow-root
+make                                   # or: $C down && make
+$C exec -T wordpress wp user list --allow-root --field=user_login   # 'demo' still there
+```
+The MariaDB init and WordPress install are **idempotent** — a restart does not re-run them (the
+entrypoints guard on `/var/lib/mysql/mysql` and `wp-config.php`).
+
+### Conceptual pairs (have the one-liner ready)
+The four required README comparisons — **VM vs Docker**, **Secrets vs Env vars**, **Docker
+network vs Host network**, **Volumes vs Bind mounts** — plus **why no `latest`** and **why PID 1
+must be the real daemon**. Short answers are in *Stage 4 → "Defense questions you should be able
+to answer"* and expanded in your `README.md` "Project description".
 
 ---
 
